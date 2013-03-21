@@ -48,6 +48,20 @@ struct dns_rr_srv {
 	struct sockaddr_storage *ss_s;	/* support multi-homed hosts */
 };
 
+/* SOA records */
+
+struct dns_rr_soa {
+	const char *zone;
+	const char *mname;
+	const char *rname;
+	uint32_t serial;
+	uint32_t refresh;
+	uint32_t retry;
+	uint32_t expiration;
+	uint32_t min_ttl;
+	struct sockaddr_storage ss;
+};
+
 /* NS records */
 
 struct dns_rr_ns {

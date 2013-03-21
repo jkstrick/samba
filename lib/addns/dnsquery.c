@@ -221,6 +221,67 @@ static bool ads_dns_parse_rr_srv( TALLOC_CTX *ctx, uint8_t *start, uint8_t *end,
 /*********************************************************************
 *********************************************************************/
 
+static bool ads_dns_parse_rr_soa( TALLOC_CTX *ctx, uint8_t *start, uint8_t *end,
+                       uint8_t **ptr, struct dns_rr_soa *soarec )
+{
+	struct dns_rr rr;
+	uint8_t *p;
+	char soaname[MAX_DNS_NAME_LENGTH];
+	int namelen;
+
+	if ( !start || !end || !soarec || !*ptr)
+		return -1;
+
+	/* Parse the RR entry.  Coming out of the this, ptr is at the beginning
+	   of the next record */
+
+	if ( !ads_dns_parse_rr( ctx, start, end, ptr, &rr ) ) {
+		DEBUG(1,("ads_dns_parse_rr_soa: Failed to parse RR record\n"));
+		return false;
+	}
+
+	if ( rr.type != T_SOA ) {
+		DEBUG(1,("ads_dns_parse_rr_soa: Bad answer type (%d)\n",
+					rr.type));
+		return false;
+	}
+
+	soarec->zone = talloc_strdup( ctx, rr.hostname);
+
+	p = rr.rdata;
+
+	/* parse SOA data */
+
+	namelen = dn_expand( start, end, p, soaname, sizeof(soaname) );
+	if ( namelen < 0 ) {
+		DEBUG(1,("ads_dns_parse_rr_soa: Failed to uncompress SOA mname!\n"));
+		return false;
+	}
+	soarec->mname = talloc_strdup( ctx, soaname );
+
+	p += namelen;
+
+	namelen = dn_expand( start, end, p, soaname, sizeof(soaname) );
+	if ( namelen < 0 ) {
+		DEBUG(1,("ads_dns_parse_rr_soa: Failed to uncompress SOA rname!\n"));
+		return false;
+	}
+	soarec->rname = talloc_strdup( ctx, soaname );
+
+	p += namelen;
+
+	soarec->serial = RIVAL(p, 0);
+	soarec->refresh = RIVAL(p, 4);
+	soarec->retry = RIVAL(p, 8);
+	soarec->expiration = RIVAL(p, 12);
+	soarec->min_ttl = RIVAL(p, 16);
+
+	return true;
+}
+
+/*********************************************************************
+*********************************************************************/
+
 static bool ads_dns_parse_rr_ns( TALLOC_CTX *ctx, uint8_t *start, uint8_t *end,
                        uint8_t **ptr, struct dns_rr_ns *nsrec )
 {
@@ -296,6 +357,8 @@ static NTSTATUS dns_send_req( TALLOC_CTX *ctx, const char *name, int q_type,
 {
 	uint8_t *buffer = NULL;
 	size_t buf_len = 0;
+	uint8_t *msg = NULL;
+	size_t msg_len = 0;
 	int resp_len = NS_PACKETSZ;
 	static time_t last_dns_check = 0;
 	static NTSTATUS last_dns_status = NT_STATUS_OK;
@@ -339,8 +402,31 @@ static NTSTATUS dns_send_req( TALLOC_CTX *ctx, const char *name, int q_type,
 			}
 		}
 
-		if ((resp_len = res_query(name, C_IN, q_type, buffer, buf_len))
-				< 0 ) {
+		if (q_type != T_SOA) {
+			resp_len = res_query(name, C_IN, q_type, buffer, buf_len);
+		} else {
+			if ( msg )
+				TALLOC_FREE( msg );
+
+			msg_len = resp_len * sizeof(uint8_t);
+
+			if (msg_len) {
+				if ((msg = talloc_array(ctx, uint8_t, buf_len))
+						== NULL ) {
+					DEBUG(0,("dns_send_req: "
+						"talloc() failed!\n"));
+					last_dns_status = NT_STATUS_NO_MEMORY;
+					last_dns_check = time_mono(NULL);
+					return last_dns_status;
+				}
+			}
+
+			res_mkquery(ns_o_query, name, C_IN, q_type, NULL, 0, NULL,
+				msg, msg_len);
+			resp_len = res_send(msg, msg_len, buffer, buf_len);
+		}
+
+		if (resp_len < 0 ) {
 			DEBUG(3,("dns_send_req: "
 				"Failed to resolve %s (%s)\n",
 				name, strerror(errno)));
@@ -577,6 +663,167 @@ NTSTATUS ads_dns_lookup_srv(TALLOC_CTX *ctx,
 
 	*dclist = dcs;
 	*numdcs = idx;
+
+	return NT_STATUS_OK;
+}
+
+/*********************************************************************
+ Simple wrapper for a DNS SOA query
+*********************************************************************/
+
+NTSTATUS ads_dns_lookup_soa(TALLOC_CTX *ctx,
+				const char *dns_hosts_file,
+				const char *dnsdomain,
+				struct dns_rr_soa **soalist,
+				int *numsoa)
+{
+	uint8_t *buffer = NULL;
+	int resp_len = 0;
+	struct dns_rr_soa *soaarray = NULL;
+	int query_count, answer_count, auth_count, additional_count;
+	uint8_t *p;
+	int rrnum;
+	int idx = 0;
+	NTSTATUS status;
+
+	if ( !ctx || !dnsdomain || !soalist ) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	if (dns_hosts_file) {
+		DEBUG(1, ("NO 'SOA' lookup available when using resolv:host file"));
+		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+	}
+
+	/* Send the request.  May have to loop several times in case
+	   of large replies */
+
+	status = dns_send_req( ctx, dnsdomain, T_SOA, &buffer, &resp_len );
+	if ( !NT_STATUS_IS_OK(status) ) {
+		DEBUG(3,("ads_dns_lookup_soa: Failed to send DNS query (%s)\n",
+			nt_errstr(status)));
+		return status;
+	}
+	p = buffer;
+
+	/* For some insane reason, the ns_initparse() et. al. routines are only
+	   available in libresolv.a, and not the shared lib.  Who knows why....
+	   So we have to parse the DNS reply ourselves */
+
+	/* Pull the answer RR's count from the header.
+	 * Use the NMB ordering macros */
+
+	query_count      = RSVAL( p, 4 );
+	answer_count     = RSVAL( p, 6 );
+	auth_count       = RSVAL( p, 8 );
+	additional_count = RSVAL( p, 10 );
+
+	DEBUG(4,("ads_dns_lookup_soa: "
+		"%d records returned in the answer section.\n",
+		answer_count));
+	DEBUG(4,("ads_dns_lookup_soa: "
+		"%d records returned in the authority section.\n",
+		auth_count));
+
+	if (answer_count + auth_count > 0) {
+		if ((soaarray = talloc_array(ctx, struct dns_rr_soa,
+						answer_count + auth_count)) == NULL ) {
+			DEBUG(0,("ads_dns_lookup_soa: "
+				"talloc() failure for %d char*'s\n",
+				answer_count + auth_count));
+			return NT_STATUS_NO_MEMORY;
+		}
+	} else {
+		soaarray = NULL;
+	}
+
+	/* now skip the header */
+
+	p += NS_HFIXEDSZ;
+
+	/* parse the query section */
+
+	for ( rrnum=0; rrnum<query_count; rrnum++ ) {
+		struct dns_query q;
+
+		if (!ads_dns_parse_query(ctx, buffer, buffer+resp_len,
+					&p, &q)) {
+			DEBUG(1,("ads_dns_lookup_soa: "
+				" Failed to parse query record!\n"));
+			return NT_STATUS_UNSUCCESSFUL;
+		}
+	}
+
+	/* now we are at the answer section */
+
+	for ( rrnum=0; rrnum<answer_count; rrnum++ ) {
+		if (!ads_dns_parse_rr_soa(ctx, buffer, buffer+resp_len,
+					&p, &soaarray[rrnum])) {
+			DEBUG(1,("ads_dns_lookup_soa: "
+				"Failed to parse answer record!\n"));
+			return NT_STATUS_UNSUCCESSFUL;
+		}
+	}
+
+	/* Parse the authority section */
+
+	for ( rrnum=answer_count; rrnum<answer_count + auth_count; rrnum++ ) {
+		if (!ads_dns_parse_rr_soa(ctx, buffer, buffer+resp_len,
+					&p, &soaarray[rrnum])) {
+			DEBUG(1,("ads_dns_lookup_soa: "
+				"Failed to parse authority record!\n"));
+			return NT_STATUS_UNSUCCESSFUL;
+		}
+	}
+	idx = rrnum;
+
+	/* Parse the additional records section */
+
+	for ( rrnum=0; rrnum<additional_count; rrnum++ ) {
+		struct dns_rr rr;
+		int i;
+
+		if (!ads_dns_parse_rr(ctx, buffer, buffer+resp_len,
+					&p, &rr)) {
+			DEBUG(1,("ads_dns_lookup_soa: Failed "
+				"to parse additional records section!\n"));
+			return NT_STATUS_UNSUCCESSFUL;
+		}
+
+		/* only interested in A records as a shortcut for having to come
+		   back later and lookup the name */
+
+		if (rr.type != T_A || rr.rdatalen != 4) {
+#if defined(HAVE_IPV6)
+			if (rr.type != T_AAAA || rr.rdatalen != 16)
+#endif
+				continue;
+		}
+
+		for ( i=0; i<idx; i++ ) {
+			if (strcmp(rr.hostname, soaarray[i].mname) == 0) {
+				if (rr.type == T_A) {
+					struct in_addr ip;
+					memcpy(&ip, rr.rdata, 4);
+					in_addr_to_sockaddr_storage(
+							&soaarray[i].ss,
+							ip);
+				}
+#if defined(HAVE_IPV6)
+				if (rr.type == T_AAAA) {
+					struct in6_addr ip6;
+					memcpy(&ip6, rr.rdata, rr.rdatalen);
+					in6_addr_to_sockaddr_storage(
+							&soaarray[i].ss,
+							ip6);
+				}
+#endif
+			}
+		}
+	}
+
+	*soalist = soaarray;
+	*numsoa = idx;
 
 	return NT_STATUS_OK;
 }

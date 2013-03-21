@@ -1134,8 +1134,11 @@ static NTSTATUS net_update_dns_internal(struct net_context *c,
 					const struct sockaddr_storage *addrs,
 					int num_addrs)
 {
+	struct dns_rr_soa *soaservers = NULL;
+	int soa_count = 0;
 	struct dns_rr_ns *nameservers = NULL;
-	int ns_count = 0, i;
+	int ns_count = 0;
+	int i;
 	NTSTATUS status = NT_STATUS_UNSUCCESSFUL;
 	DNS_ERROR dns_err;
 	fstring dns_server;
@@ -1152,59 +1155,70 @@ static NTSTATUS net_update_dns_internal(struct net_context *c,
 	dnsdomain++;
 
 	dns_hosts_file = lp_parm_const_string(-1, "resolv", "host file", NULL);
-	status = ads_dns_lookup_ns(ctx, dns_hosts_file,
-				   dnsdomain, &nameservers, &ns_count);
-	if ( !NT_STATUS_IS_OK(status) || (ns_count == 0)) {
-		/* Child domains often do not have NS records.  Look
-		   for the NS record for the forest root domain
-		   (rootDomainNamingContext in therootDSE) */
 
-		const char *rootname_attrs[] = 	{ "rootDomainNamingContext", NULL };
-		LDAPMessage *msg = NULL;
-		char *root_dn;
-		ADS_STATUS ads_status;
+	status = ads_dns_lookup_soa(ctx, dns_hosts_file,
+				   dnsdomain, &soaservers, &soa_count);
+	if ( !NT_STATUS_IS_OK(status) || (soa_count == 0)) {
 
-		if ( !ads->ldap.ld ) {
-			ads_status = ads_connect( ads );
-			if ( !ADS_ERR_OK(ads_status) ) {
-				DEBUG(0,("net_update_dns_internal: Failed to connect to our DC!\n"));
+		status = ads_dns_lookup_ns(ctx, dns_hosts_file,
+					   dnsdomain, &nameservers, &ns_count);
+		if ( !NT_STATUS_IS_OK(status) || (ns_count == 0)) {
+			/* Child domains often do not have NS records.  Look
+			   for the NS record for the forest root domain
+			   (rootDomainNamingContext in therootDSE) */
+
+			const char *rootname_attrs[] = 	{ "rootDomainNamingContext", NULL };
+			LDAPMessage *msg = NULL;
+			char *root_dn;
+			ADS_STATUS ads_status;
+
+			if ( !ads->ldap.ld ) {
+				ads_status = ads_connect( ads );
+				if ( !ADS_ERR_OK(ads_status) ) {
+					DEBUG(0,("net_update_dns_internal: Failed to connect to our DC!\n"));
+					goto done;
+				}
+			}
+
+			ads_status = ads_do_search(ads, "", LDAP_SCOPE_BASE,
+						   "(objectclass=*)",
+						   rootname_attrs, &msg);
+			if (!ADS_ERR_OK(ads_status)) {
 				goto done;
 			}
-		}
 
-		ads_status = ads_do_search(ads, "", LDAP_SCOPE_BASE,
-				       "(objectclass=*)", rootname_attrs, &msg);
-		if (!ADS_ERR_OK(ads_status)) {
-			goto done;
-		}
+			root_dn = ads_pull_string(ads, ctx, msg,
+						  "rootDomainNamingContext");
+			if ( !root_dn ) {
+				ads_msgfree( ads, msg );
+				goto done;
+			}
 
-		root_dn = ads_pull_string(ads, ctx, msg,  "rootDomainNamingContext");
-		if ( !root_dn ) {
+			root_domain = ads_build_domain( root_dn );
+
+			/* cleanup */
 			ads_msgfree( ads, msg );
-			goto done;
+
+			/* try again for NS servers */
+
+			status = ads_dns_lookup_ns(ctx, dns_hosts_file,
+						   root_domain, &nameservers,
+						   &ns_count);
+
+			if ( !NT_STATUS_IS_OK(status) || (ns_count == 0)) {
+				DEBUG(3,("net_update_dns_internal: Failed to find name server for the %s "
+				 "realm\n", ads->config.realm));
+				goto done;
+			}
+
+			dnsdomain = root_domain;
+
 		}
-
-		root_domain = ads_build_domain( root_dn );
-
-		/* cleanup */
-		ads_msgfree( ads, msg );
-
-		/* try again for NS servers */
-
-		status = ads_dns_lookup_ns(ctx, dns_hosts_file, root_domain,
-					   &nameservers, &ns_count);
-
-		if ( !NT_STATUS_IS_OK(status) || (ns_count == 0)) {
-			DEBUG(3,("net_update_dns_internal: Failed to find name server for the %s "
-			 "realm\n", ads->config.realm));
-			goto done;
-		}
-
-		dnsdomain = root_domain;
-
 	}
 
-	for (i=0; i < ns_count; i++) {
+	/* Only SOA or NS queries will have been successfully performed,
+	   so we use whichever one has information. */
+	for (i=0; i < soa_count || i < ns_count; i++) {
 
 		uint32_t flags = DNS_UPDATE_SIGNED |
 				 DNS_UPDATE_UNSIGNED |
@@ -1219,12 +1233,21 @@ static NTSTATUS net_update_dns_internal(struct net_context *c,
 
 		status = NT_STATUS_UNSUCCESSFUL;
 
-		/* Now perform the dns update - we'll try non-secure and if we fail,
-		   we'll follow it up with a secure update */
+		/* Now perform the dns update - we'll try non-secure and if we
+		 * fail, we'll follow it up with a secure update */
+		
+		if(soa_count > 0) {
+			fstrcpy( dns_server, soaservers[i].mname );
+			dns_err = DoDNSUpdate(dns_server,
+					      soaservers[i].zone, machine_name,
+					      addrs, num_addrs, flags);
+		} else {
+			fstrcpy( dns_server, nameservers[i].hostname );
+			dns_err = DoDNSUpdate(dns_server,
+					      dnsdomain, machine_name, addrs,
+					      num_addrs, flags);
+		}
 
-		fstrcpy( dns_server, nameservers[i].hostname );
-
-		dns_err = DoDNSUpdate(dns_server, dnsdomain, machine_name, addrs, num_addrs, flags);
 		if (ERR_DNS_IS_OK(dns_err)) {
 			status = NT_STATUS_OK;
 			goto done;

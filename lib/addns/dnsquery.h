@@ -29,6 +29,11 @@ NTSTATUS ads_dns_lookup_srv(TALLOC_CTX *ctx,
 				const char *name,
 				struct dns_rr_srv **dclist,
 				int *numdcs);
+NTSTATUS ads_dns_lookup_soa(TALLOC_CTX *ctx,
+				const char *dns_hosts_file,
+				const char *dnsdomain,
+				struct dns_rr_soa **soalist,
+				int *numsoa);
 NTSTATUS ads_dns_lookup_ns(TALLOC_CTX *ctx,
 				const char *dns_hosts_file,
 				const char *dnsdomain,
