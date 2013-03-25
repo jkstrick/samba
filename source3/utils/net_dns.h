@@ -32,7 +32,7 @@
 
 #include "../lib/addns/dns.h"
 
-DNS_ERROR DoDNSUpdate(char *pszServerName,
+DNS_ERROR DoDNSUpdate(char *realm, char *pszServerName,
 		      const char *pszDomainName, const char *pszHostName,
 		      const struct sockaddr_storage *sslist,
 		      size_t num_addrs,

@@ -1238,12 +1238,12 @@ static NTSTATUS net_update_dns_internal(struct net_context *c,
 		
 		if(soa_count > 0) {
 			fstrcpy( dns_server, soaservers[i].mname );
-			dns_err = DoDNSUpdate(dns_server,
+			dns_err = DoDNSUpdate(ads->config.realm, dns_server,
 					      soaservers[i].zone, machine_name,
 					      addrs, num_addrs, flags);
 		} else {
 			fstrcpy( dns_server, nameservers[i].hostname );
-			dns_err = DoDNSUpdate(dns_server,
+			dns_err = DoDNSUpdate(ads->config.realm, dns_server,
 					      dnsdomain, machine_name, addrs,
 					      num_addrs, flags);
 		}

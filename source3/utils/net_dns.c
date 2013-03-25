@@ -29,7 +29,7 @@
 /*********************************************************************
 *********************************************************************/
 
-DNS_ERROR DoDNSUpdate(char *pszServerName,
+DNS_ERROR DoDNSUpdate(char *realm, char *pszServerName,
 		      const char *pszDomainName, const char *pszHostName,
 		      const struct sockaddr_storage *sslist, size_t num_addrs,
 		      uint32_t flags)
@@ -125,12 +125,12 @@ DNS_ERROR DoDNSUpdate(char *pszServerName,
 			goto error;
 		}
 
-		err = dns_negotiate_sec_ctx( pszDomainName, pszServerName,
+		err = dns_negotiate_sec_ctx( realm, pszServerName,
 					     keyname, &gss_context, DNS_SRV_ANY );
 
 		/* retry using the Windows 2000 DNS hack */
 		if (!ERR_DNS_IS_OK(err)) {
-			err = dns_negotiate_sec_ctx( pszDomainName, pszServerName,
+			err = dns_negotiate_sec_ctx( realm, pszServerName,
 						     keyname, &gss_context, 
 						     DNS_SRV_WIN2000 );
 		}
